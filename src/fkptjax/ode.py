@@ -23,6 +23,13 @@ class ModelDerivatives:
     - Frame-lagging corrections (KFL terms) from the Newtonian potential
     - Differential interaction terms (dI) from the scalar field dynamics
 
+    We also have the following models:
+    - LCDM: here we fix mu(a,k) = 1
+    - HDKI: This models consist of 3 variants at this point
+    i) mg_variant: "mu_OmDE" --- mu(a) = 1 + mu_0 * Omega_DE/Omega_Lambda
+    i) mg_variant: "BZ" --- Bertschinger-Zukin parameterization.
+    iii) mg_variant: "binning" --- binnings in redshift and scale for mu.
+
     References
     ----------
     See equations in csrc/paper.pdf for the fkPT formalism and implementation details
@@ -33,8 +40,37 @@ class ModelDerivatives:
     This implementation mirrors the Hu-Sawicky Model functions in csrc/models.c.
     All calculations are performed in conformal time η = ln(a) where a is the scale factor.
     """
-
-    def __init__(self, om: float, ol: float, fR0: float, beta2: float = 1.0/6.0, nHS: int = 1, screening: int = 1, omegaBD: float = 0.0) -> None:
+     
+    def __init__(
+        self,
+        om: float,
+        ol: float,
+        # --- HS / f(R) parameters
+        fR0: float = 0.0,
+        beta2: float = 1.0/6.0,
+        nHS: int = 1,
+        screening: int = 1,
+        omegaBD: float = 0.0,
+        # --- model switches
+        model: str = "HS",
+        mg_variant: str = "mu_OmDE",
+        # --- HDKI: mu_OmDE
+        mu0: float = 0.0,
+        # --- HDKI: BZ-like
+        beta_1: float = 1.0,
+        lambda_1: float = 0.0,
+        exp_s: float = 0.0,
+        # --- HDKI: binning (defaults correspond to GR-ish)
+        mu1: float = 0.0,
+        mu2: float = 0.0,
+        mu3: float = 0.0,
+        mu4: float = 0.0,
+        k_c: float = 0.1,
+        k_tw: float = 0.01,
+        z_div: float = 1.0,
+        z_TGR: float = 10.0,
+        z_tw: float = 0.5,
+    ) -> None:
         """Initialize the Hu-Sawicki f(R) model parameters.
 
         Parameters
@@ -64,14 +100,42 @@ class ModelDerivatives:
         The class stores invH0 = c/H₀ = 2997.92458 Mpc/h for converting between
         physical and comoving scales.
         """
-        self.invH0 = 2997.92458 # c/H0 in Mpc/h units
-        self.fR0 = fR0
-        self.om = om
-        self.ol = ol
-        self.beta2 = beta2
-        self.nHS = nHS
-        self.screening = screening
-        self.omegaBD = omegaBD
+        self.invH0 = 2997.92458
+
+        # background
+        self.om = float(om)
+        self.ol = float(ol)
+
+        # HS / f(R)
+        self.fR0 = float(fR0)
+        self.beta2 = float(beta2)
+        self.nHS = int(nHS)
+        self.screening = int(screening)
+        self.omegaBD = float(omegaBD)
+
+        # switches
+        self.model = str(model)
+        self.mg_variant = str(mg_variant)
+
+        # HDKI: mu_OmDE
+        self.mu0 = float(mu0)
+
+        # HDKI: BZ-like
+        self.beta_1 = float(beta_1)
+        self.lambda_1 = float(lambda_1)
+        self.exp_s = float(exp_s)
+
+        # HDKI: binning
+        self.mu1 = float(mu1)
+        self.mu2 = float(mu2)
+        self.mu3 = float(mu3)
+        self.mu4 = float(mu4)
+        self.k_c = float(k_c)
+        self.k_tw = float(k_tw)
+        self.z_div = float(z_div)
+        self.z_TGR = float(z_TGR)
+        self.z_tw = float(z_tw)
+
 
     def mass(self, eta: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
         """Compute effective mass of the scalar field (scalaron) in f(R) gravity.
@@ -94,17 +158,68 @@ class ModelDerivatives:
         Implements mass_HS from csrc/models.c. The mass evolves with redshift
         according to the Hu-Sawicki model power law with index nHS.
         """
-        return (
-            1 / self.invH0 * np.sqrt(1 / (2 * np.abs(self.fR0)))
+        model = getattr(self, "model", "HS").upper() # in case people select e.g. 'hdki' instead of 'HDKI' (so we force capital letters)
+
+        # ------------------------------------------------------------
+        # LCDM (GR): mu = 1
+        # ------------------------------------------------------------
+        if model in ("LCDM", "GR"):
+            return 1e30
+
+        # ------------------------------------------------------------
+        # HS (Hu-Sawicki): mu = 1 + 2*beta2*k^2/(k^2 + a^2 m(eta)^2)
+        # ------------------------------------------------------------
+        if model == "HS":
+            return (1 / self.invH0 * np.sqrt(1 / (2 * np.abs(self.fR0)))
             * np.pow(self.om * np.exp(-3 * eta) + 4 * self.ol, (2 + self.nHS) / 2)
             / np.pow(self.om + 4 * self.ol, (1 + self.nHS) / 2)
-        )
+            )
+
+        # ------------------------------------------------------------
+        # HDKI: mu depends on mg_variant (matches models.c)
+        #   - mu_OmDE:  1 + mu0 * Omega_DE(a)
+        #   - BZ:       (1 + beta1 * x) / (1 + x), x = lambda1^2 a^s k^2
+        #   - binning:  tanh transitions in k and z
+        # ------------------------------------------------------------
+        if model == "HDKI":
+            small = 1.0e-60
+            a = np.exp(eta)
+            v = getattr(self, "mg_variant", "mu_OmDE")
+
+            if v == "mu_OmDE":
+                # if you truly want h3=0 for this variant
+                return 1e30
+
+            elif v == "BZ":
+                # to match mu_BZ exactly in the ratio form: h3 = lambda_1^2 * a^exp_s
+                h3 = np.power(self.lambda_1, 2.0) * np.power(a, self.exp_s)
+                return np.sqrt(1.0 / (h3 + small)) / a
+
+            elif v == "binning":
+                # mass is determined by the large-scale and small-scale limits of the binning methods.
+                # from the large-scale (low-k) limit we get:
+                #h1 = 
+                ## from the small-scale (high-k) limit we get:
+                #alphat = 
+                ## now we substitute in the general formula (binning is constant through these limits):
+                #mu = 
+                return self.k_c/a
+
+            else:
+                raise ValueError(f"Unknown HDKI mg_variant={v!r} for mass()")
+
+        raise ValueError(f"Unknown model={model!r} (expected 'LCDM'/'GR', 'HS', or 'HDKI')")
+
 
     def mu(self, eta: Union[float, Float64NDArray], k: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
         """Compute scale-dependent modification to the Poisson equation μ(k, η).
 
-        The μ function quantifies how the gravitational force is modified in f(R) gravity.
-        It approaches 1 on small scales (screened) and 1+2β² on large scales (unscreened).
+        The μ function quantifies how the gravitational force is modified in modified gravity.
+
+        Supports:
+          - model='LCDM' (or 'GR'): μ = 1
+          - model='HS'           :  Hu-Sawicki f(R) (mu -> 1 on small scales (screened) and 1+2β² on large scales (unscreened).)
+          - model='HDKI'         :  Horndeski-like, with mg_variant in {'mu_OmDE','BZ','binning'}
 
         Parameters
         ----------
@@ -124,8 +239,56 @@ class ModelDerivatives:
         For k >> k_screening: μ → 1 (screened, GR recovered)
         For k << k_screening: μ → 1 + 2β² (unscreened, enhanced gravity)
         """
+
         k2 = np.square(k)
-        return 1 + 2 * self.beta2 * k2 / (k2 + np.exp(2 * eta) * np.square(self.mass(eta)))
+        model = getattr(self, "model", "HS").upper() # in case people select e.g. 'hdki' instead of 'HDKI' (so we force capital letters)
+
+        # ------------------------------------------------------------
+        # LCDM (GR): mu = 1
+        # ------------------------------------------------------------
+        if model in ("LCDM", "GR"):
+            return 1.0
+
+        # ------------------------------------------------------------
+        # HS (Hu-Sawicki): mu = 1 + 2*beta2*k^2/(k^2 + a^2 m(eta)^2)
+        # ------------------------------------------------------------
+        if model == "HS":
+            return 1.0 + 2.0 * self.beta2 * k2 / (k2 + np.exp(2.0 * eta) * np.square(self.mass(eta)))
+
+        # ------------------------------------------------------------
+        # HDKI: mu depends on mg_variant (matches models.c)
+        #   - mu_OmDE:  1 + mu0 * Omega_DE(a)
+        #   - BZ:       (1 + beta1 * x) / (1 + x), x = lambda1^2 a^s k^2
+        #   - binning:  tanh transitions in k and z
+        # ------------------------------------------------------------
+        if model == "HDKI":
+            v = getattr(self, "mg_variant", "mu_OmDE")
+            a = np.exp(eta)
+
+            if v == "mu_OmDE":
+                OmDE_over_OmL = 1.0 / (self.ol + self.om * np.power(a, -3.0))
+                return 1.0 + self.mu0 * OmDE_over_OmL
+
+            if v == "BZ":
+                x = np.power(self.lambda_1, 2.0) * k2 * np.power(a, self.exp_s)
+                return (1.0 + self.beta_1 * x) / (1.0 + x)
+
+            if v == "binning":
+                z = 1.0 / a - 1.0
+                Tk = np.tanh((k - self.k_c) / self.k_tw)
+                mu_z1 = 0.5*(self.mu2 + self.mu1) + 0.5*(self.mu2 - self.mu1)*Tk
+                mu_z2 = 0.5*(self.mu4 + self.mu3) + 0.5*(self.mu4 - self.mu3)*Tk
+                Tz_div = np.tanh((z - self.z_div) / self.z_tw)
+                Tz_TGR = np.tanh((z - self.z_TGR) / self.z_tw)
+                return (
+                    0.5*(1.0 + mu_z1)
+                    + 0.5*(mu_z2 - mu_z1)*Tz_div
+                    + 0.5*(1.0 - mu_z2)*Tz_TGR
+                )
+
+            raise ValueError(f"Unknown HDKI mg_variant={v!r}")
+
+        raise ValueError(f"Unknown model={model!r} (expected 'LCDM'/'GR', 'HS', or 'HDKI')")
 
     def PiF(self, eta: Union[float, Float64NDArray], k: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
         """Compute the scalar field propagator function Π_F(k, η).
@@ -173,11 +336,17 @@ class ModelDerivatives:
         Implements M2_HS from csrc/models.c. When screening=0, returns 0.
         M₂ scales as |f_R0|⁻² and increases toward the past.
         """
-        return self.screening * (
-            9 / (4 * np.square(self.invH0)) * np.square(1 / np.abs(self.fR0))
-            * np.pow(self.om * np.exp(-3 * eta) + 4 * self.ol, 5)
-            / np.pow(self.om + 4 * self.ol, 4)
-        )
+
+        model = getattr(self, "model", "HS").upper() # in case people select e.g. 'hdki' instead of 'HDKI' (so we force capital letters)
+
+        if model in ("LCDM", "HS"):
+            return self.screening * (
+                9 / (4 * np.square(self.invH0)) * np.square(1 / np.abs(self.fR0))
+                * np.pow(self.om * np.exp(-3 * eta) + 4 * self.ol, 5)
+                / np.pow(self.om + 4 * self.ol, 4)
+            )
+        else:
+            return 0.0
 
     def OmM(self, eta: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
         """Compute matter density parameter Ωₘ(η) as a function of conformal time.
@@ -490,11 +659,17 @@ class ModelDerivatives:
         Implements M3_HS from csrc/models.c. When screening=0, returns 0.
         M₃ scales as |f_R0|⁻³.
         """
-        return self.screening * (
-            45.0 / (8.0 * np.square(self.invH0)) * np.power(1 / np.abs(self.fR0), 3.0)
-            * np.power(self.om * np.exp(-3.0 * eta) + 4.0 * self.ol, 7.0)
-            / np.power(self.om + 4.0 * self.ol, 6.0)
-        )
+
+        model = getattr(self, "model", "HS").upper() # in case people select e.g. 'hdki' instead of 'HDKI' (so we force capital letters)
+
+        if model in ("LCDM", "HS"):
+            return self.screening * (
+                45.0 / (8.0 * np.square(self.invH0)) * np.power(1 / np.abs(self.fR0), 3.0)
+                * np.power(self.om * np.exp(-3.0 * eta) + 4.0 * self.ol, 7.0)
+                / np.power(self.om + 4.0 * self.ol, 6.0)
+            )
+        else:
+            return 0.0
 
     def KFL2(self, eta: float, x: float, k: float, p: float) -> float:
         """Compute second-order frame-lagging kernel KFL2 for third-order.
