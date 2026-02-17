@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Union, Optional
+from typing import Callable, Tuple, Union
 
 import numpy as np
 
@@ -121,7 +121,6 @@ class ModelDerivatives:
         # switches
         self.model = str(model)
         self.mg_variant = str(mg_variant)
-        self.ide_variant = str(ide_variant)
 
         # HDKI: mu_OmDE
         self.mu0 = float(mu0)
@@ -141,8 +140,9 @@ class ModelDerivatives:
         self.z_div = float(z_div)
         self.z_TGR = float(z_TGR)
         self.z_tw = float(z_tw)
-
+        
         # --- IDE parameters
+        self.ide_variant = str(ide_variant)
         self.beta = float(beta)
         self.w = float(w)
         self.wa = float(wa)
@@ -233,7 +233,9 @@ class ModelDerivatives:
                     + 0.5*(mu_z2 - mu_z1)*Tz_div
                     + 0.5*(1.0 - mu_z2)*Tz_TGR
                 )
-                
+
+            raise ValueError(f"Unknown HDKI mg_variant={v!r}")
+        
         # ------------------------------------------------------------
         # IDE models: adding the G_eff/G = mu term
         # ------------------------------------------------------------
@@ -242,16 +244,15 @@ class ModelDerivatives:
             
             if v == "IDEModel1":
                 rho_de_by_rho_m = self.ol/self.om
-                return 1.0 + self.beta*2.0/(3.0*self.om)*rho_de_by_rho_m*(-2.0 + 3.0*self.w + self.beta*(1.0+rho_de_by_rho_m))
+                mu = 1.0 + self.beta*2.0/(3.0*self.om)*rho_de_by_rho_m*(-2.0 + 3.0*self.w + self.beta*(1.0+rho_de_by_rho_m))
+                return mu
                         
             if v == "IDEModel2":
                 return 1.0
 
             if v == "DS":
                 return 1.0
-                
-        # --- IDE modifications end -------------------------------------
-        
+
         raise ValueError(f"Unknown model={model!r} (expected 'LCDM'/'GR', 'HS', 'HDKI', or 'IDE')")
 
     def f1(self, eta: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
