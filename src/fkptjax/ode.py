@@ -76,8 +76,8 @@ class ModelDerivatives:
         # --- HDKI: growth index
         gamma_0 : float = 1.0,
         gamma_a: float = 0.0,
-        GI_tk: float = 0.0,
-        GI_ds: float = 0.0,
+        t_k: float = 0.0,
+        d_s: float = 0.0,
 
     ) -> None:
         """Initialize the Hu-Sawicki f(R) model parameters.
@@ -151,8 +151,8 @@ class ModelDerivatives:
         # HDKI: growth index
         self.gamma_0 = float(gamma_0)
         self.gamma_a = float(gamma_a)
-        self.GI_tk = float(GI_tk)
-        self.GI_ds = float(GI_ds)
+        self.t_k = float(t_k)
+        self.d_s = float(d_s)
 
     def _isitgr_k_windows(self, k):
         # Mirrors Fortran ISiTGR_k_windows
@@ -326,8 +326,8 @@ class ModelDerivatives:
                 # aH_over_c in [h/Mpc] (matches fkpt k units)
                 aH_over_c = a * np.sqrt(Ea2) / self.invH0  # [h/Mpc]
             
-                ds = self.GI_ds   # width in k-units (same units as k)
-                tk = self.GI_tk   # multiplicative factor setting transition scale: k ~ tk * aH_over_c
+                ds = self.d_s   # width in k-units (same units as k)
+                tk = self.t_k   # multiplicative factor setting transition scale: k ~ tk * aH_over_c
             
                 # If user sets ds<=0 or tk<=0, fall back to no scale-dependence
                 if (ds is None) or (tk is None) or (ds <= 0.0) or (tk <= 0.0):
@@ -372,8 +372,8 @@ class ModelDerivatives:
                 aH_over_c = a * np.sqrt(Ea2) / self.invH0  # [h/Mpc]
 
                 # Yukawa-like gate parameters
-                n = self.GI_ds   # power (dimensionless): 1,2,3...
-                alpha = self.GI_tk  # dimensionless: transition around k ~ alpha * aH_over_c
+                n = self.d_s   # power (dimensionless): 1,2,3...
+                alpha = self.t_k  # dimensionless: transition around k ~ alpha * aH_over_c
 
                 # If user sets invalid params, fall back to no scale-dependence
                 if (n is None) or (alpha is None) or (n <= 0.0) or (alpha <= 0.0):
