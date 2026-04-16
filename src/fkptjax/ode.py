@@ -78,6 +78,8 @@ class ModelDerivatives:
         gamma_a: float = 0.0,
         t_k: float = 0.0,
         d_s: float = 0.0,
+        # --- nDGP
+        H0rc: float = 1.0e30,
 
     ) -> None:
         """Initialize the Hu-Sawicki f(R) model parameters.
@@ -153,6 +155,9 @@ class ModelDerivatives:
         self.gamma_a = float(gamma_a)
         self.t_k = float(t_k)
         self.d_s = float(d_s)
+
+        # nDGP
+        self.H0rc = float(H0rc)
 
     def _isitgr_k_windows(self, k):
         # Mirrors Fortran ISiTGR_k_windows
@@ -231,6 +236,20 @@ class ModelDerivatives:
                  / np.power(self.om + 4.0 * self.ol, (1.0 + self.nHS) / 2.0))
 
             return 1.0 + 2.0 * self.beta2 * k2 / (k2 + (a * m) ** 2)
+
+        # ------------------------------------------------------------
+        # nDGP: mu(a) = 1 + 1/(3 beta(a))
+        # beta(a) = 1 + 2 E(a) H0rc [1 - 0.5 Omega_m(a)]
+        # using a flat LCDM background with (om, ol)
+        # ------------------------------------------------------------
+        if model == "NDGP":
+            a = np.exp(eta)
+            Ea2 = self.om * np.power(a, -3.0) + self.ol
+            E = np.sqrt(Ea2)
+            Om = (self.om * np.power(a, -3.0)) / Ea2
+
+            beta = 1.0 + 2.0 * E * self.H0rc * (1.0 - 0.5 * Om)
+            return 1.0 + 1.0 / (3.0 * beta)
 
         # ------------------------------------------------------------
         # HDKI: mu depends on mg_variant (matches models.c)
