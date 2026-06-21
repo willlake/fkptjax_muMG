@@ -7,7 +7,6 @@ import scipy.integrate
 from fkptjax.types import Float64NDArray
 from fkptjax.odeint import odeint
 
-
 class ModelDerivatives:
     """Hu-Sawicki f(R) modified gravity model for fkPT calculations.
 
@@ -89,6 +88,12 @@ class ModelDerivatives:
         eftcamb_h1_interp=None,   # callable: eta -> h1(eta)
         eftcamb_h3_interp=None,   # callable: eta -> h3(eta)
         eftcamb_h5_interp=None,   # callable: eta -> h5(eta)
+        # --- internal massive-neutrino source table
+        # This is populated upstream when the single public option is enabled.
+        # ``None`` means mu_nu=1.
+        neutrino_correction: Callable | None = None,
+        # --- optional numba fast path for the PHENOM/binning RHS
+        use_numba: bool = False,
     ) -> None:
         """Initialize the Hu-Sawicki f(R) model parameters.
 
@@ -174,6 +179,108 @@ class ModelDerivatives:
         self.eftcamb_h3_interp = eftcamb_h3_interp
         self.eftcamb_h5_interp = eftcamb_h5_interp
 
+        # Internal massive-neutrino source correction. This is data supplied
+        # by the top-level theory wrapper, not a second user-facing switch.
+        if neutrino_correction is not None and not callable(neutrino_correction):
+            raise TypeError(
+                "neutrino_correction must be None or a callable mu_nu(eta, k)."
+            )
+        self.neutrino_correction = neutrino_correction
+
+        # Optional numba fast path: only for the PHENOM/binning RHS, and only if
+        # numba is importable.  When active, firstOrder/secondOrder/thirdOrder
+        # dispatch to the compiled functions in binning_numba; all other models
+        # and the use_numba=False default are completely unaffected.
+        self.use_numba = bool(use_numba)
+        self._use_numba_binning = False
+        self._nb_P = None
+        if self.use_numba:
+            from . import binning_numba as _bnb
+            if (_bnb.HAVE_NUMBA
+                    and str(self.model).upper() == "PHENOM"
+                    and str(self.mg_variant).strip().lower() == "binning"):
+                self._bnb = _bnb
+                self._nb_P = _bnb.pack_constants(
+                    om=self.om, ol=self.ol,
+                    mu1=self.mu1, mu2=self.mu2, mu3=self.mu3, mu4=self.mu4,
+                    z_div=self.z_div, z_TGR=self.z_TGR, z_tw=self.z_tw,
+                    scale_bins=self.scale_bins,
+                    k_TGR=self.k_TGR, k_c=self.k_c, k_S=self.k_S, k_tw=self.k_tw,
+                )
+                self._use_numba_binning = True
+
+        # The compiled binning RHS does not accept a tabulated neutrino source.
+        if self._use_numba_binning and self.neutrino_correction is not None:
+            raise NotImplementedError(
+                "Massive-neutrino FKPT corrections are not implemented in the "
+                "numba PHENOM/binning RHS. Use use_numba=False."
+            )
+
+        # Internal diagnostic / optimization flag used by the FKPT rescaling
+        # branch.  It describes the MG part only; a supplied neutrino_correction
+        # still makes the effective Poisson source scale-dependent.
+        self.is_MG_scale_dependent = self._infer_is_MG_scale_dependent()
+
+    def _infer_is_MG_scale_dependent(self) -> bool:
+        """Return whether the model's MG modification depends explicitly on k.
+
+        Scale-independent examples:
+          - LCDM / GR
+          - nDGP
+          - HDKI + mu_OmDE
+
+        Scale-dependent examples:
+          - Hu-Sawicki / f(R)
+          - HDKI + BZ
+          - HDKI + EFT_DE in general
+          - PHENOM/binning when scale_bins=True
+          - growth-index variants only when the optional k-transition is active
+        """
+        model = str(getattr(self, "model", "HS")).strip().upper()
+        variant = str(getattr(self, "mg_variant", "")).strip().lower()
+
+        if model in ("LCDM", "GR", "NDGP"):
+            return False
+
+        if model == "HS":
+            return True
+
+        if model == "HDKI":
+            if variant in ("mu_omde", "muomde"):
+                return False
+            if variant == "bz":
+                return True
+            if variant in ("eft_de", "eftde"):
+                # h1*(1+k^2 h5)/(1+k^2 h3) is generally scale-dependent.
+                return True
+            return True
+
+        if model == "PHENOM":
+            if variant == "binning":
+                return bool(getattr(self, "scale_bins", False))
+            if variant == "growth_index":
+                return (
+                    getattr(self, "d_s", 0.0) is not None
+                    and getattr(self, "t_k", 0.0) is not None
+                    and float(getattr(self, "d_s", 0.0)) > 0.0
+                    and float(getattr(self, "t_k", 0.0)) > 0.0
+                )
+            if variant == "growth_index_yukawa":
+                return (
+                    getattr(self, "d_s", 0.0) is not None
+                    and getattr(self, "t_k", 0.0) is not None
+                    and float(getattr(self, "d_s", 0.0)) > 0.0
+                    and float(getattr(self, "t_k", 0.0)) > 0.0
+                )
+            return True
+
+        return True
+
+    @property
+    def is_effective_mu_scale_dependent(self) -> bool:
+        """Whether the full source mu_MG * mu_nu depends explicitly on k."""
+        return bool(self.is_MG_scale_dependent or self.neutrino_correction is not None)
+
     def _isitgr_k_windows(self, k):
         # Mirrors Fortran ISiTGR_k_windows
         t1 = np.tanh((k - self.k_TGR) / self.k_tw)
@@ -196,7 +303,7 @@ class ModelDerivatives:
         # high-z: GR, mu3, mu4, GR
         return 1.0 * W1 + self.mu3 * W2 + self.mu4 * W3 + 1.0 * W4
 
-    def mu(self, eta: Union[float, Float64NDArray], k: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
+    def mu_mg(self, eta: Union[float, Float64NDArray], k: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
         """Compute scale-dependent modification to the Poisson equation μ(k, η).
 
         The μ function quantifies how the gravitational force is modified in modified gravity.
@@ -432,6 +539,45 @@ class ModelDerivatives:
             f"Unknown model={model!r} "
             "(expected 'LCDM'/'GR', 'HS', 'NDGP', 'HDKI', or 'PHENOM')"
         )
+
+    @staticmethod
+    def _ones_like_broadcast(eta, k):
+        """Return one with the broadcasted shape of ``eta`` and ``k``."""
+        eta_arr, k_arr = np.broadcast_arrays(
+            np.asarray(eta, dtype=float),
+            np.asarray(k, dtype=float),
+        )
+        out = np.ones_like(k_arr, dtype=float)
+        return float(out) if out.ndim == 0 else out
+
+    def mu_neutrino(
+        self,
+        eta: Union[float, Float64NDArray],
+        k: Union[float, Float64NDArray],
+    ) -> Union[float, Float64NDArray]:
+        """Return the internal cb-source correction ``mu_nu(k, eta)``.
+
+        ``None`` means that the caller requested no neutrino correction, so
+        this returns unity. The top-level theory wrapper decides whether to
+        supply this object.
+        """
+        if self.neutrino_correction is None:
+            return self._ones_like_broadcast(eta, k)
+        return self.neutrino_correction(eta, k)
+
+    def mu(
+        self,
+        eta: Union[float, Float64NDArray],
+        k: Union[float, Float64NDArray],
+    ) -> Union[float, Float64NDArray]:
+        """Effective Poisson modification used by the FKPT ODEs.
+
+        ``mu_eff(k, eta) = mu_MG(k, eta) * mu_nu(k, eta)``.
+
+        Here ``mu_nu=1`` when no internal correction object was provided,
+        reproducing the previous FKPT behavior exactly.
+        """
+        return self.mu_mg(eta, k) * self.mu_neutrino(eta, k)
 
     def f1(self, eta: Union[float, Float64NDArray]) -> Union[float, Float64NDArray]:
         """Compute logarithmic growth rate f₁(η) = d ln D/d ln a.
@@ -845,6 +991,8 @@ class ModelDerivatives:
         Implements derivsFirstOrder from csrc/gsm_diffeqs.c.
         The second-order ODE is: D'' + (2-f₁)D' - f₁μ(k)D = 0.
         """
+        if self._use_numba_binning:
+            return self._bnb.nb_firstOrder(x, np.atleast_2d(y), np.atleast_1d(k).astype(np.float64), self._nb_P)
         f1x = self.f1(x)
         return np.array([y[1], f1x * self.mu(x, k) * y[0] - (2 - f1x) * y[1]])
 
@@ -854,6 +1002,8 @@ class ModelDerivatives:
           y = [Dk, Dk', Dp, Dp', D2, D2']
         where D2 corresponds to the k_f = |k+p| mode and depends on angle x = cos(theta).
         """
+        if self._use_numba_binning:
+            return self._bnb.nb_secondOrder(eta, np.asarray(y, dtype=np.float64), x, k, p, self._nb_P)
         f2 = self.f1(eta)       # in your code: f1(eta) = 3/2 * Omega_m = notebook's f2
         f1 = 2.0 - f2           # friction term = 2 + H'/H = 2 - 3/2 Omega_m = notebook's f1
 
@@ -905,6 +1055,8 @@ class ModelDerivatives:
         Implements derivsThirdOrder from csrc/gsm_diffeqs.c.
         Third-order source combines S3I, S3II, S3FL, and S3dI terms.
         """
+        if self._use_numba_binning:
+            return self._bnb.nb_thirdOrder(eta, np.asarray(y, dtype=np.float64), x, k, p, self._nb_P)
         f1eta = self.f1(eta)
         f2eta = 2 - f1eta
         kplusp = self.kpp(x, k, p)
@@ -1131,3 +1283,4 @@ def kernel_constants(
     AprimeLS = dD2p / C - D2p * Cp / (C * C)
 
     return ALS, AprimeLS, KR1LS, KR1pLS
+    
