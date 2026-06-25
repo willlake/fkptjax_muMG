@@ -3,6 +3,8 @@ from typing import Callable, Tuple, Union
 import numpy as np
 
 import scipy.integrate
+from scipy.integrate import cumulative_trapezoid
+from scipy.interpolate import CubicSpline
 
 from fkptjax.types import Float64NDArray
 from fkptjax.odeint import odeint
@@ -82,6 +84,12 @@ class ModelDerivatives:
         gamma_a: float = 0.0,
         t_k: float = 0.0,
         d_s: float = 0.0,
+        # --- EFTofDE: alpha-basis
+        aB0: float = 0.0,
+        aM0: float = 0.0,
+        aT0: float = 0.0,
+        M2_ini: float = 1.0,
+        gravity_model: str = "propto_omega",
     ) -> None:
         """Initialize the Hu-Sawicki f(R) model parameters.
 
@@ -161,6 +169,14 @@ class ModelDerivatives:
         self.gamma_a = float(gamma_a)
         self.t_k = float(t_k)
         self.d_s = float(d_s)
+
+        # EFTofDE: alpha basis, only implement prop_to_ode
+        self.aB0 = float(aB0)
+        self.aM0 = float(aM0)
+        self.aT0 = float(aT0)
+        self.M2_ini = float(M2_ini)
+        self.gravity_model = str(gravity_model)
+    
 
     def _isitgr_k_windows(self, k):
         # Mirrors Fortran ISiTGR_k_windows
@@ -266,6 +282,23 @@ class ModelDerivatives:
 
             beta = 1.0 + 2.0 * E * self.r_c * (1.0 - 0.5 * Om)
             return 1.0 + 1.0 / (3.0 * beta)
+
+        # ------------------------------------------------------------
+        # EFTofDE: mu(k, eta) from h1, h3, h5 background functions
+        #   mu(k, eta) = h1(eta) * (1 + k^2 h5(eta)) / (1 + k^2 h3(eta))
+        # using a flat LCDM background with (om, w0, wa)
+        # ------------------------------------------------------------
+        
+        if model == "EFTOFDE":
+            eftofde = EFTofDE(self.om,
+                              w0  = self.w0,
+                              wa  = self.wa,
+                              aB0 = self.aB0,
+                              aM0 = self.aM0,
+                              aT0 = self.aT0,
+                              M2_ini = self.M2_ini,
+                              gravity_model = self.gravity_model)
+            return eftofde.Y(eta,k)
 
         # ------------------------------------------------------------
         # HDKI-like parameterizations
@@ -1064,3 +1097,277 @@ def kernel_constants(f0: float, derivs: ModelDerivatives, solver: ODESolver,
     KR1pLS = (21.0/5.0) * dD3 / (Dk * Dp * Dp) / (3.0 * f0)
 
     return ALS, AprimeLS, KR1LS, KR1pLS
+
+
+class EFTofDE(object):
+    def __init__(
+        self,
+        Omega0_m,
+        w0=-1.0,
+        wa=0.0,
+        aB0 = 0.0,
+        aM0 = 0.0,
+        aT0 = 0.0,
+        M2_ini = 1.0,
+        gravity_model='propto_omega',
+        Physical_Unit=True,
+        x0=-7.0,
+        x1=0.0,
+        nxgrid=500,
+    ):
+        if Physical_Unit:
+            self.c_km_s = 299792.458
+        else:
+            self.c_km_s = 1
+            
+        self.Omega0_m = Omega0_m
+        self.w0 = w0
+        self.wa = wa
+        self.H0 = 100  ### 100*h
+
+        ##########The four parameters needed for alpha-basis Horndeski
+        self.aB0 = aB0
+        self.aM0 = aM0
+        self.aT0 = aT0
+        self.M2_ini = M2_ini
+        ############# aK0 is ignored since it won't enter EoM
+        # Note the difference in alphaB between hi-class and Cusin et al. 2018
+        # self.aB0 *= -2.0
+
+        self.x1 = x1
+        self.x0 = x0
+        self.xlo = x0
+        self.ngrid = int(nxgrid)
+
+        self.get_EFTDE_alphas(gravity_model=gravity_model)
+        self.get_EFTDE_M2star()
+
+
+    def get_EFTDE_M2star(self, bc='not-a-knot'):
+        """
+        Build a spline for M_*^2(x) on x in [self.x0, self.x1], using
+          d ln M_*^2 / dx = alpha_M(x),
+          M_*^2(self.x0) = self.M2_ini.
+        """
+        x0, x1 = float(self.x0), float(self.x1)
+        x = np.linspace(x0, x1, int(self.ngrid), dtype=float)
+
+        aM = np.array([float(self.alpha_M(xi)) for xi in x], dtype=float)
+        I = cumulative_trapezoid(aM, x, initial=0.0)
+        y = float(self.M2_ini) * np.exp(I)
+        y[0] = float(self.M2_ini)
+        self.M2_star = CubicSpline(x, y, bc_type=bc, extrapolate=False)
+
+    def get_EFTDE_alphas(self, gravity_model='propto_omega'):
+
+        if gravity_model == 'constant':
+            self.alpha_B = lambda x: self.aB0
+            self.alpha_T = lambda x: self.aT0
+            self.alpha_M = lambda x: self.aM0
+
+            self.dalpha_Bdx = lambda x: 0.0
+            self.dalpha_Tdx = lambda x: 0.0
+            self.dalpha_Mdx = lambda x: 0.0
+
+        elif gravity_model == 'propto_omega':
+            self.alpha_B = lambda x: self.aB0 * self.Ode(x)
+            self.alpha_T = lambda x: self.aT0 * self.Ode(x)
+            self.alpha_M = lambda x: self.aM0 * self.Ode(x)
+
+            self.dalpha_Bdx = lambda x: self.aB0 * self.dOdedx(x)
+            self.dalpha_Tdx = lambda x: self.aT0 * self.dOdedx(x)
+            self.dalpha_Mdx = lambda x: self.aM0 * self.dOdedx(x)
+        else:
+            raise ValueError(f'Unknown gravity_model: {gravity_model}')
+
+    # ---- Helpers: background derivatives used throughout ----
+
+    def dHdt_over_H2(self, x):
+        """
+        Returns (dH/dt)/H^2 = \dot H / H^2.
+        Assumes flat matter + dark energy background with Om(x)=Omega_m and Ode=1-Om.
+        """
+        Om = self.Om(x)
+        Ode = 1.0 - Om
+        return -1.5 * (1.0 + self.w(x) * Ode)
+
+    def a_of_x(self, x):
+        return np.exp(x)
+
+    def w(self, x):
+        a = self.a_of_x(x)
+        return self.w0 + self.wa * (1.0 - a)
+
+    def dwdx(self, x):
+        a = self.a_of_x(x)
+        return -self.wa * a
+
+    def f_de(self, x):
+        a = self.a_of_x(x)
+        w0, wa = self.w0, self.wa
+        return a ** (-3.0 * (1.0 + w0 + wa)) * np.exp(3.0 * wa * (a - 1.0))
+
+    def E2(self, x):
+        a = self.a_of_x(x)
+        Om0 = self.Omega0_m
+        return Om0 * a ** (-3.0) + (1.0 - Om0) * self.f_de(x)
+
+    def H(self, x):
+        return self.H0 * np.sqrt(self.E2(x))
+
+    def Om(self, x):
+        a = self.a_of_x(x)
+        return self.Omega0_m * a ** (-3.0) / self.E2(x)
+
+    def Om_over_M2star(self, x):
+        return self.Om(x) / self.M2_star(x)
+
+    def Ode(self, x):
+        return 1.0 - self.Om(x)
+
+    def dOmdx(self, x):
+        w = self.w(x)
+        Om = self.Om(x)
+        Ode = 1.0 - Om
+        return 3.0 * w * Om * Ode
+
+    def dOdedx(self, x):
+        return -self.dOmdx(x)
+
+    def dHdx(self, x):
+        H = self.H(x)
+        Ode = self.Ode(x)
+        w = self.w(x)
+        return -1.5 * H * (1.0 + w * Ode)
+
+    def d2Hdx2(self, x):
+        H = self.H(x)
+        dH = self.dHdx(x)
+        Ode = self.Ode(x)
+        w = self.w(x)
+        dw = self.dwdx(x)
+        dOde = self.dOdedx(x)
+        A = 1.0 + w * Ode
+        return -1.5 * (dH * A + H * (dw * Ode + w * dOde))
+
+
+    # ---- Paper: ArXiv:1902.06978 ; Eqs. (62)–(69) ----
+
+    def xi(self, x):
+        """Paper xi = H'/H = d ln H / d ln a."""
+        return self.dHdx(x) / self.H(x)
+
+    def dxi_hdx(self, x):
+        """Derivative of xi with respect to x = ln a."""
+        H = self.H(x)
+        dH = self.dHdx(x)
+        d2H = self.d2Hdx2(x)
+        return d2H / H - (dH / H) ** 2
+
+    def Omega_tilde_m(self, x):
+        """
+        \tilde{\Omega}_m = rho_m / (3 M_*^2 H^2)
+                         = Omega_m / M_*^2
+        """
+        return self.Om_over_M2star(x)
+
+    def w_m_eff(self, x):
+        """
+        Effective matter equation of state entering Eq. (63).
+        For pressureless matter only, wm = 0.
+        """
+        return 0.0
+
+    def alpha1(self, x):
+        """
+        Eq. (62):
+        alpha1 = alpha_B + (alpha_B - 2) alpha_T + 2 alpha_M
+        """
+        aB = self.alpha_B(x)
+        aT = self.alpha_T(x)
+        aM = self.alpha_M(x)
+        return aB + (aB - 2.0) * aT + 2.0 * aM
+
+    def alpha2(self, x):
+        """
+        Eq. (63):
+        alpha2 = alpha_B * xi + alpha_B' - 2 xi - 3(1 + wm) Omega_tilde_m
+        where xi = H'/H and prime = d/d ln a.
+        """
+        aB = self.alpha_B(x)
+        xi = self.xi(x)
+        daB = self.dalpha_Bdx(x)
+        wm = self.w_m_eff(x)
+        Omt = self.Omega_tilde_m(x)
+        return aB * xi + daB - 2.0 * xi - 3.0 * (1.0 + wm) * Omt
+
+    def mu2(self, x, mu2_floor=None):
+        """
+        Eq. (69):
+        mu^2 = -3[(2 xi^2 + xi' + xi(3 + alpha_M)) alpha_B + xi alpha2]
+        """
+        xi = self.xi(x)
+        dxi_h = self.dxi_hdx(x)
+        aB = self.alpha_B(x)
+        aM = self.alpha_M(x)
+        a2 = self.alpha2(x)
+
+        val = -3.0 * ((2.0 * xi * xi + dxi_h + xi * (3.0 + aM)) * aB + xi * a2)
+
+        if mu2_floor is not None:
+            return max(val, mu2_floor)
+        return val
+
+    def h1(self, x):
+        """Eq. (64): h1 = (1 + alpha_T) / M_*^2"""
+        return (1.0 + self.alpha_T(x)) / self.M2_star(x)
+
+
+    def h3(self, x):
+        """Eq. (66)"""
+        a = self.a_of_x(x)
+        aB = self.alpha_B(x)
+        a1 = self.alpha1(x)
+        a2 = self.alpha2(x)
+        H = self.H(x)
+        mu2 = self.mu2(x)
+        # return self.c_km_s**2*((2.0 - aB) * a1 + 2.0 * a2) / (2.0 * mu2)
+        return self.c_km_s**2*((2.0 - aB) * a1 + 2.0 * a2) / (2.0 * a * a * H * H * mu2)
+
+    def h5(self, x):
+        """
+        Eq. (68)
+        h5 = [ ((1 + alpha_M)/(1 + alpha_T)) * alpha1 + alpha2 ] / (H^2 mu^2)
+        """
+        a = self.a_of_x(x)
+        a1 = self.alpha1(x)
+        a2 = self.alpha2(x)
+        aM = self.alpha_M(x)
+        aT = self.alpha_T(x)
+        H = self.H(x)
+        mu2 = self.mu2(x)
+        # return self.c_km_s**2*(((1.0 + aM) / (1.0 + aT)) * a1 + a2) / (mu2)
+        return self.c_km_s**2*(((1.0 + aM) / (1.0 + aT)) * a1 + a2) / (a * a * H * H * mu2)
+
+    def Y(self, x, k):
+        """
+        Eq. (24):
+            Y = h1 * (1 + k^2 h5) / (1 + k^2 h3)
+        """
+        h1 = self.h1(x)
+        h3 = self.h3(x)
+        h5 = self.h5(x)
+        k2 = np.asarray(k) ** 2
+        return h1 * (h5) / (h3)
+
+
+    # def Y(self, x, k):
+    #     """
+    #     Eq. (24):
+    #         Y = h1 * (1 + k^2 h5) / (1 + k^2 h3)
+    #     """
+    #     h1 = self.h1(x)
+    #     h3 = self.h3(x)
+    #     h5 = self.h5(x)
+    #     k2 = np.asarray(k) ** 2
+    #     return h1 * (1.0 + k2 * h5) / (1.0 + k2 * h3)
