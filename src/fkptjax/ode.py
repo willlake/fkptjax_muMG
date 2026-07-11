@@ -39,6 +39,13 @@ class ModelDerivatives:
     This implementation mirrors the Hu-Sawicky Model functions in csrc/models.c.
     All calculations are performed in conformal time η = ln(a) where a is the scale factor.
     """
+
+    # EFTDE is considered effectively scale-independent only over the DESI
+    # fitting window. In that case its single-scale representative is k=0.1.
+    _EFTDE_K_MIN = 0.01
+    _EFTDE_K_MAX = 0.3
+    _EFTDE_K_PIVOT = 0.1
+    _EFTDE_SCALE_TOL = 0.03
      
     def __init__(
         self,
@@ -219,6 +226,7 @@ class ModelDerivatives:
         # Internal diagnostic / optimization flag used by the FKPT rescaling
         # branch.  It describes the MG part only; a supplied neutrino_correction
         # still makes the effective Poisson source scale-dependent.
+        self.is_EFTDE_scale_dependent = self._infer_is_EFTDE_scale_dependent()
         self.is_MG_scale_dependent = self._infer_is_MG_scale_dependent()
 
     def _infer_is_MG_scale_dependent(self) -> bool:
@@ -251,8 +259,7 @@ class ModelDerivatives:
             if variant == "bz":
                 return True
             if variant in ("eft_de", "eftde"):
-                # h1*(1+k^2 h5)/(1+k^2 h3) is generally scale-dependent.
-                return True
+                return self.is_EFTDE_scale_dependent
             return True
 
         if model == "PHENOM":
@@ -280,6 +287,65 @@ class ModelDerivatives:
     def is_effective_mu_scale_dependent(self) -> bool:
         """Whether the full source mu_MG * mu_nu depends explicitly on k."""
         return bool(self.is_MG_scale_dependent or self.neutrino_correction is not None)
+
+    def _infer_is_EFTDE_scale_dependent(self) -> bool:
+        """Return whether EFTDE mu varies appreciably over DESI scales.
+
+        This is an effective, survey-range classification, not a statement
+        that the model is scale-independent at every k.  We compare the exact
+        EFTDE source over 0.01 <= k <= 0.3 h/Mpc with its value at the
+        representative DESI scale k_pivot = 0.1 h/Mpc.  If the maximum
+        fractional departure exceeds 3% at any sampled time, the model is
+        treated as scale-dependent.
+        """
+        model = str(getattr(self, "model", "")).strip().upper()
+        variant = str(getattr(self, "mg_variant", "")).strip().lower()
+        if model != "HDKI" or variant not in ("eft_de", "eftde"):
+            return False
+
+        if (
+            self.eftcamb_h1_interp is None
+            or self.eftcamb_h3_interp is None
+            or self.eftcamb_h5_interp is None
+        ):
+            return False
+
+        k_pivot = self._EFTDE_K_PIVOT
+        kbins = np.geomspace(self._EFTDE_K_MIN, self._EFTDE_K_MAX, 20)
+        etabins = np.linspace(-4.0, 0.0, 10)
+        k2 = np.square(kbins)
+        k2_pivot = k_pivot**2
+
+        for eta in etabins:
+            h1 = self.eftcamb_h1_interp(eta)
+            h3 = self.eftcamb_h3_interp(eta)
+            h5 = self.eftcamb_h5_interp(eta)
+
+            denom_k = 1.0 + k2 * h3
+            denom_pivot = 1.0 + k2_pivot * h3
+            if (
+                not np.all(np.isfinite([h1, h3, h5]))
+                or not np.all(np.isfinite(denom_k))
+                or not np.isfinite(denom_pivot)
+                or np.any(np.abs(denom_k) < 1.0e-12)
+                or np.abs(denom_pivot) < 1.0e-12
+            ):
+                return True
+
+            mu_k = h1 * (1.0 + k2 * h5) / denom_k
+            mu_pivot = h1 * (1.0 + k2_pivot * h5) / denom_pivot
+
+            if not np.all(np.isfinite(mu_k)) or not np.isfinite(mu_pivot):
+                return True
+
+            normalization = max(np.abs(float(mu_pivot)), 1.0e-12)
+            max_fractional_departure = np.max(
+                np.abs(mu_k - mu_pivot) / normalization
+            )
+            if max_fractional_departure > self._EFTDE_SCALE_TOL:
+                return True
+
+        return False
 
     def _isitgr_k_windows(self, k):
         # Mirrors Fortran ISiTGR_k_windows
@@ -408,12 +474,17 @@ class ModelDerivatives:
                     or self.eftcamb_h5_interp is None
                 ):
                     return 1.0   # GR fallback
-
                 h1 = self.eftcamb_h1_interp(eta)
                 h3 = self.eftcamb_h3_interp(eta)
                 h5 = self.eftcamb_h5_interp(eta)
+                if self.is_EFTDE_scale_dependent:
+                    return h1 * (1.0 + k2 * h5) / (1.0 + k2 * h3)
 
-                return h1 * (1.0 + k2 * h5) / (1.0 + k2 * h3)
+                # The model is effectively scale-independent over DESI scales.
+                # Use the exact EFTDE source at the representative DESI scale,
+                # rather than its k -> 0 or k -> infinity limit.
+                k2_pivot = self._EFTDE_K_PIVOT**2
+                return h1 * (1.0 + k2_pivot * h5) / (1.0 + k2_pivot * h3)
 
             raise ValueError(
                 f"Unknown HDKI mg_variant={v!r} "
@@ -1234,23 +1305,9 @@ def kernel_constants(
 ) -> Tuple[float, float, float, float]:
     """
     Compute one-loop kernel constants (ALS, AprimeLS, KR1LS, KR1pLS).
-
-    For ordinary models, use the standard ODE-based notebook definitions.
-
-    For EFTCAMB Horndeski models encoded as:
-        model = "HDKI"
-        mg_variant = "EFT_DE"
-
-    use h1(eta) for the large-scale A kernel and dh1/deta for A',
-    while still using the ODE system for KR1LS and KR1pLS.
+    
     """
-    model_u = str(getattr(derivs, "model", "")).upper()
-    variant = str(getattr(derivs, "mg_variant", "")).strip().lower()
 
-    is_eft_de = (
-        model_u == "HDKI"
-        and variant in ("eft_de", "eftde")
-    )
 
     Dk, dDk, Dp, dDp, D2p, dD2p, D2m, dD2m, D3, dD3 = D3v2(
         x, KMIN, KMIN, derivs, solver
@@ -1258,23 +1315,6 @@ def kernel_constants(
 
     KR1LS = (21.0 / 5.0) * D3 / (Dk * Dp * Dp)
     KR1pLS = (21.0 / 5.0) * dD3 / (Dk * Dp * Dp) / (3.0 * f0)
-
-    if is_eft_de:
-        eta_out = solver.xstop
-        h1_interp = getattr(derivs, "eftcamb_h1_interp", None)
-
-        if h1_interp is None:
-            ALS = 1.0
-            AprimeLS = 0.0
-        else:
-            ALS = float(h1_interp(eta_out))
-            deps = 1e-4
-            AprimeLS = float(
-                (h1_interp(eta_out + deps) - h1_interp(eta_out - deps))
-                / (2.0 * deps)
-            )
-
-        return ALS, AprimeLS, KR1LS, KR1pLS
 
     C = (3.0 / 7.0) * Dk * Dp
     Cp = (3.0 / 7.0) * (dDk * Dp + Dk * dDp)
